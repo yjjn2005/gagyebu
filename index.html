@@ -151,7 +151,12 @@
   <!-- 설정 -->
   <section id="panel-settings" class="panel">
     <div class="card">
-      <h2>☁️ 모바일·PC 연동 (Firebase)</h2>
+      <h2>☁️ 자동 클라우드 동기화</h2>
+      <button class="btn" onclick="cloudLoad(true)">📱 클라우드 동기화 (최신 데이터 불러오기)</button>
+      <p class="hint">앱을 열면 클라우드의 최신 데이터를 자동으로 불러옵니다. 다른 기기에서 입력한 내역이 안 보이면 위 버튼을 누르세요. 입력·수정·삭제는 자동으로 클라우드에 저장됩니다. 설정이나 코드 입력은 필요 없습니다.</p>
+    </div>
+    <div class="card">
+      <h2>모바일·PC 연동 (Firebase — 선택사항)</h2>
       <label>Firebase 설정 (firebaseConfig 붙여넣기)</label>
       <textarea id="fbConfig" rows="6" placeholder='{"apiKey":"...","authDomain":"...","databaseURL":"...","projectId":"..."}'></textarea>
       <label>가족 코드 (모든 기기에서 동일하게 입력)</label>
@@ -201,10 +206,15 @@ const CATS = {
   ]
 };
 const ICO = {}; [...CATS.expense, ...CATS.income].forEach(c => ICO[c.name] = c.ico);
+/* ===== 클라우드(Gist) 자동 동기화 ===== */
+const GIST_ID = '2d0e5b594d81601f79e550c6b3404d35';
+const GIST_FILE = 'yhi-gagyebu-data.json';
+
 const PIE_COLORS = ['#2d6a4f','#40916c','#52b788','#74c69d','#95d5b2','#d62828','#f77f00','#fcbf49','#1d6fd1','#6a4c93','#b5838d','#8d99ae'];
 
 /* ===== 상태 ===== */
 let entries = {};   // id -> {type,date,amount,category,memo}
+let deletedIds = {}; // 삭제 내역 (동기화용 tombstone)
 let budgets = {};   // category -> amount
 let curType = 'expense';
 let viewYM = new Date().toISOString().slice(0,7);
@@ -220,6 +230,8 @@ function init(){
   fillCategorySelect();
   renderBudgetInputs();
   loadLocal();
+  setupSyncFromURL();
+  cloudLoad(false);
   const saved = JSON.parse(localStorage.getItem('yh_fb') || 'null');
   if(saved){
     $('fbConfig').value = saved.config;
@@ -232,10 +244,12 @@ function init(){
 function loadLocal(){
   entries = JSON.parse(localStorage.getItem('yh_entries') || '{}');
   budgets = JSON.parse(localStorage.getItem('yh_budgets') || '{}');
+  deletedIds = JSON.parse(localStorage.getItem('yh_deleted') || '{}');
 }
 function saveLocal(){
   localStorage.setItem('yh_entries', JSON.stringify(entries));
   localStorage.setItem('yh_budgets', JSON.stringify(budgets));
+  localStorage.setItem('yh_deleted', JSON.stringify(deletedIds));
 }
 
 /* ===== Firebase 연동 ===== */
@@ -275,14 +289,74 @@ function connectFirebase(fromButton){
   }catch(e){ toast('연동 오류: ' + e.message); }
 }
 
+/* ===== 클라우드(Gist) 동기화 ===== */
+function setupSyncFromURL(){
+  try{
+    const p = new URLSearchParams(location.search);
+    const s = p.get('sync');
+    if(s){
+      localStorage.setItem('yh_gist_token', atob(s.replace(/ /g,'+')));
+      history.replaceState(null, '', location.pathname);
+      toast('☁️ 자동 클라우드 저장이 설정되었습니다');
+    }
+  }catch(e){}
+}
+function gistToken(){ return localStorage.getItem('yh_gist_token') || ''; }
+
+async function cloudLoad(manual){
+  try{
+    if(manual) toast('☁️ 클라우드에서 불러오는 중...');
+    const r = await fetch('https://api.github.com/gists/' + GIST_ID + '?t=' + Date.now());
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    const g = await r.json();
+    const f = g.files && g.files[GIST_FILE];
+    if(!f) throw new Error('데이터 파일 없음');
+    let content = f.content;
+    if(f.truncated) content = await (await fetch(f.raw_url)).text();
+    const d = JSON.parse(content);
+    deletedIds = Object.assign({}, deletedIds, d.deleted || {});
+    const remote = d.entries || {};
+    entries = Object.assign({}, entries, remote);
+    Object.keys(deletedIds).forEach(id => delete entries[id]);
+    if(d.budgets && Object.keys(d.budgets).length) budgets = Object.assign({}, budgets, d.budgets);
+    saveLocal(); renderAll(); setSync(true);
+    // 이 기기에만 있는 변경분이 있으면 클라우드에 반영
+    const localOnly = Object.keys(entries).some(id => !(id in remote)) ||
+                      Object.keys(remote).some(id => !(id in entries));
+    if(localOnly) cloudPush();
+    if(manual) toast('☁️ 동기화 완료 — 총 ' + Object.keys(entries).length + '건');
+  }catch(e){ if(manual) toast('동기화 실패: ' + e.message); }
+}
+
+let cloudPushTimer = null;
+function cloudPush(){
+  const tk = gistToken();
+  if(!tk) return;
+  clearTimeout(cloudPushTimer);
+  cloudPushTimer = setTimeout(async () => {
+    try{
+      const files = {};
+      files[GIST_FILE] = {content: JSON.stringify({entries, budgets, deleted: deletedIds, updated: new Date().toISOString()})};
+      const r = await fetch('https://api.github.com/gists/' + GIST_ID, {
+        method: 'PATCH',
+        headers: {'Authorization': 'token ' + tk, 'Content-Type': 'application/json'},
+        body: JSON.stringify({files})
+      });
+      if(r.ok) setSync(true);
+      else toast('클라우드 저장 실패 (' + r.status + ')');
+    }catch(e){}
+  }, 1200);
+}
+
 function setSync(on){
   const b = $('syncBadge');
-  b.textContent = on ? '☁️ 동기화 중' : '로컬 모드';
+  b.textContent = on ? '☁️ 클라우드 연결됨' : '로컬 모드';
   b.className = on ? 'on' : '';
 }
 
 function pushData(){
   saveLocal();
+  cloudPush();
   if(dbRef) dbRef.update({entries, budgets}).catch(()=>toast('동기화 실패 (오프라인?)'));
 }
 
@@ -311,6 +385,7 @@ function addEntry(){
 function delEntry(id){
   if(!confirm('이 내역을 삭제할까요?')) return;
   delete entries[id];
+  deletedIds[id] = Date.now();
   if(dbRef) dbRef.child('entries/' + id).remove().catch(()=>{});
   pushData(); renderAll();
 }
